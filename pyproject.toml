@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=77"]  # a license given as an SPDX expression (PEP 639)
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-ecc"
+version = "0.2.1"
+description = "Version-consistent experience consumption for agent training: validate recorded experience against a chosen verifier version, re-evaluate it when needed, and track what each training step actually consumes."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.10"
+dependencies = []
+keywords = ["reinforcement learning", "agents", "evaluation", "grading", "reproducibility", "swe-bench", "appworld"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.optional-dependencies]
+# the official SWE-bench harness: log parsing, and re-execution in local Docker containers
+swebench = ["swebench==5.0.2"]
+# the AppWorld evaluator, for re-grading recorded end states
+appworld = ["appworld>=0.1.3"]
+# the reference re-verification service runs on the standard library; install the extras of the backends it serves
+service = []
+test = ["pytest>=7"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+agent_ecc = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "tests"]
+addopts = "-q"
+markers = [
+    "swebench: needs the official swebench harness (skipped when it is not installed)",
+    "docker: needs a local Docker daemon and SWE-bench images (opt in with AGENT_ECC_DOCKER_TESTS=1)",
+]

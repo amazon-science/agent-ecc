@@ -1,0 +1,18 @@
+# Ignore the `build/` directory in the package root.
+/build
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+.pytest_cache/
+.venv/
+venv/
+.coverage
+htmlcov/
+
+# example outputs
+examples/lifecycle/out/
+examples/prepared/out/

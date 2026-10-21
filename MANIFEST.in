@@ -1,0 +1,14 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# What the source distribution holds beyond the package: the documentation, the examples and the whole test suite
+# (its helpers included), so that `pytest` runs from an unpacked sdist. The internal build file and release checklist
+# never ship.
+include CHANGELOG.md LICENSE NOTICE README.md
+graft docs
+graft examples
+graft tests
+exclude Config RELEASE.md
+prune examples/lifecycle/out
+prune examples/prepared/out
+global-exclude __pycache__ *.py[cod] .pytest_cache
