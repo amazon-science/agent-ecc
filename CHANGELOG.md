@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.1 (unreleased)
+## 0.2.1 (2026-10-21)
 
 * Example `examples/posthoc`: a sidecar's evidence is read only when its outcome digest (the trainer's capture of the
   trajectory, the attempt and the patch digest) matches the one recomputed from the sidecar; a missing or mismatched
@@ -8,7 +8,7 @@
   the summary). `--no-outcome-digest` reads runs whose sidecars record none.
 * Tests: the check on a small run directory, with a sidecar naming another record's patch and log.
 
-## 0.2.0 (unreleased)
+## 0.2.0 (2026-10-21, first public release with 0.2.1)
 
 * Seal: a **target pin**. `SealSession(pin="e0" | seq)` makes the batch epoch the pinned epoch, read from the
   publication log (`seal.pinned_epoch`; `"e0"` is the first grader publication), whatever the pointer names; the
