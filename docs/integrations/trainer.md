@@ -149,6 +149,9 @@ Notes:
   wait bound, for instance) can be given to `preparer.retire(...)` so that they are not prepared again.
 * **A pinned control**: `arm_session("never", registry, scorer, cache=...)` seals every batch under the startup epoch
   while later versions are published and graded; its decisions record the pin and what the pointer named.
+* **Transport failures**: `HTTPBackend` retries a post that failed before any evaluation (three attempts by default,
+  with jittered backoff, within `deadline_s`); `decision.stats["transport"]` counts the attempts, the retried requests,
+  the ones given up on and the failures by reason.
 
 ## 5. Consumption (learner)
 

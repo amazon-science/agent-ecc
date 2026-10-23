@@ -127,7 +127,9 @@ A pinned seal's decision also holds `"target_pin": {"pin": "e0", "resolved": tru
 at the read (`epoch` is then the pinned epoch). A decision without a pin has no `target_pin` key, so its identity is
 the one it had before pins existed. A seal that took prepared results has `stats["prepared"]`: how every request it
 would have executed was answered (`requests`, `prepared`, `sync`, `by_reason` such as `prepared:ready`,
-`prepared:waited`, `sync:no_job`, `sync:taken_over`, and `waited_s`).
+`prepared:waited`, `sync:no_job`, `sync:taken_over`, and `waited_s`). A seal whose executions went over a transport
+(`HTTPBackend`) has `stats["transport"]`: `requests`, `attempts`, `retried`, `gave_up` and failed attempts by `reasons`,
+counted per request (a post that carries n requests counts n times).
 
 Member `action`: `reuse`, `reparse`, `reexec`, `undeterminable`, `ungoverned`, `pending` (audit and discard: a re-parse
 or an execution would be needed), `off`, `failed`. `consistent` is true when the member was graded under exactly the
@@ -316,7 +318,9 @@ class Backend(Protocol):
 One result per request, in order; a failed execution is an `ExecResult` with `status="error"`, not an exception.
 
 * `ExecRequest(family, kind, task_id, execution, inputs, params)`: `inputs` maps a role to an object digest in the
-  store. `ExecResult(request_id, status, outputs, facts, cost, error)`.
+  store. `ExecResult(request_id, status, outputs, facts, cost, error, transport)`: `transport` is how a client obtained
+  the result over a network (`attempts`, failed attempts by `reasons`, `gave_up`), recorded only when set and ignored
+  by comparisons.
 * `RecordedBackend(results)` replays recorded raw results by request id (`from_jsonl(path)`); a request without one is
   an infrastructure error (`not_recorded`). `RecordingBackend(inner, results_path)` records a live backend's results
   for later replay.
@@ -337,8 +341,15 @@ python -m agent_ecc.recompute.service --backend {swebench-docker,appworld,record
 * `POST /v1/execute` with `{"requests": [ExecRequest...], "objects": {digest: base64}}` ->
   `{"results": [ExecResult...], "objects": {digest: base64}, "seconds": s}`
 
-`HTTPBackend(url)` is the client: it uploads the input objects requests name, verifies every returned object against
-its digest before storing it, and turns transport failures into infrastructure errors.
+`HTTPBackend(url, attempts=3, backoff_s=1.0, max_backoff_s=30.0, deadline_s=None)` is the client: it uploads the
+input objects requests name and verifies every returned object against its digest before storing it. A post that fails
+in transport (a connection reset or refused, a timeout before a response, an HTTP 5xx without results) is sent again,
+unchanged, after a full-jitter backoff (`backoff_s`, doubling, at most `max_backoff_s`), for at most `attempts` posts
+within `deadline_s` (default `timeout_s`, which also bounds each attempt). An answer that holds results is never sent
+again, whatever its verdicts or status; every post carries the same requests, so request ids and cache keys do not
+change. Each result's `transport` records the attempts and the failures by reason (`reset`, `refused`, `timeout`,
+`http_5xx`). A failure that outlasts the attempts or the deadline is an infrastructure error (`gave_up`), which the
+scorer and a preparer do not execute again: the transport is the one place that retries it.
 
 ## Learner log (`export.LearnerLine`, `export.StepCompletion`)
 

@@ -130,6 +130,11 @@ For each check of the target spec, given the record's runs and earlier verdicts:
   marker without the test exit-code record after it, and a parser exception. They are re-executed (up to `retries`,
   default 2, further executions) and otherwise leave the check **undeterminable**. A recorded run that hit an
   infrastructure error is re-executed as well (`recorded_infra="reexec"`), never read as a fail.
+* **A transport failure is retried where it happens**: the re-verification client sends a post that failed before any
+  evaluation (a connection reset or refused, a timeout before a response, an HTTP 5xx without results) again, with
+  jittered backoff, a bounded number of attempts and one deadline, the same requests every time. An answer with
+  results is never sent again. A failure that outlasts the attempts leaves the check undeterminable and is not
+  re-executed by the scorer, so a seal neutralizes a group for a transport failure only after the retries.
 * One exception is explicit: SWE-bench's **official rule** (`verdict="official"`) reproduces the official harness's
   own end-to-end report on every log, under which every log it does not resolve is a fail, a timeout and a log without
   output markers included. It exists to reproduce verdicts recorded under that rule. The rule is part of every check's

@@ -21,14 +21,19 @@ from __future__ import annotations
 
 import argparse
 import base64
+import dataclasses
+import http.client
 import json
+import random
+import socket
 import sys
 import threading
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
 
 from ..canonical import digest_bytes
 from ..store import ContentStore, DirectoryStore, MemoryStore
@@ -119,15 +124,30 @@ def make_server(service: ReferenceService, host: str = "127.0.0.1", port: int = 
 class HTTPBackend:
     """A backend that sends requests to a reference service.
 
-    ``send_objects`` uploads the input objects requests name (set False when the service shares the store).
-    ``batch_size`` splits large batches into several posts."""
+    ``send_objects`` uploads the input objects requests name (set False when the service shares the store);
+    ``batch_size`` splits large batches into several posts. A post that fails in transport (connection reset or
+    refused, a timeout before a response, an HTTP 5xx without results) is sent again, unchanged, for at most
+    ``attempts`` posts, after a full-jitter backoff (``backoff_s``, doubling, at most ``max_backoff_s``) and within
+    ``deadline_s`` (default ``timeout_s``, which bounds each attempt); an answer with results is never sent again.
+    Each result's ``transport`` records the attempts; a failure that outlasts them is an infrastructure error."""
 
-    def __init__(self, url: str, *, timeout_s: float = 3600.0, send_objects: bool = True,
-                 batch_size: int = 64) -> None:
+    def __init__(self, url: str, *, timeout_s: float = 3600.0, send_objects: bool = True, batch_size: int = 64,
+                 attempts: int = 3, backoff_s: float = 1.0, max_backoff_s: float = 30.0,
+                 deadline_s: float | None = None, sleep: Callable[[float], Any] = time.sleep,
+                 clock: Callable[[], float] = time.monotonic, rng: random.Random | None = None) -> None:
+        if int(attempts) < 1:
+            raise ValueError("attempts must be >= 1")
         self.url = url.rstrip("/")
         self.timeout_s = float(timeout_s)
         self.send_objects = send_objects
         self.batch_size = max(1, int(batch_size))
+        self.attempts = int(attempts)
+        self.backoff_s = float(backoff_s)
+        self.max_backoff_s = float(max_backoff_s)
+        self.deadline_s = self.timeout_s if deadline_s is None else float(deadline_s)
+        self.sleep = sleep
+        self.clock = clock
+        self.rng = rng if rng is not None else random.Random()
 
     def health(self, timeout_s: float = 5.0) -> dict:
         with urllib.request.urlopen(f"{self.url}/v1/health", timeout=timeout_s) as response:
@@ -150,17 +170,13 @@ class HTTPBackend:
                         if digest not in objects and store.contains(digest):
                             objects[digest] = base64.b64encode(store.get(digest)).decode("ascii")
             body = json.dumps({"requests": [r.to_dict() for r in requests], "objects": objects}).encode("utf-8")
-            req = urllib.request.Request(f"{self.url}/v1/execute", data=body,
-                                         headers={"Content-Type": "application/json"}, method="POST")
-            with urllib.request.urlopen(req, timeout=self.timeout_s) as response:
-                payload = json.loads(response.read())
-        except urllib.error.HTTPError as error:
-            detail = error.read()[:300].decode("utf-8", "replace")
-            return [infra_result(r, f"service: HTTP {error.code}: {detail}", seconds=time.time() - t0)
-                    for r in requests]
-        except Exception as error:  # noqa: BLE001 - transport failures are infrastructure errors
+        except Exception as error:  # noqa: BLE001 - inputs that cannot be sent are an infrastructure error
             return [infra_result(r, f"service: {type(error).__name__}: {error}", seconds=time.time() - t0)
                     for r in requests]
+        payload, failure, transport = self._send(body)
+        if payload is None:
+            return [dataclasses.replace(infra_result(r, f"service: {failure}", seconds=time.time() - t0),
+                                        transport=transport) for r in requests]
         returned = payload.get("objects") or {}
         results = []
         for request, d in zip(requests, payload.get("results") or []):
@@ -176,10 +192,75 @@ class HTTPBackend:
                         store.put(raw)
             except Exception as error:  # noqa: BLE001
                 result = infra_result(request, f"service: {error}")
-            results.append(result)
+            results.append(dataclasses.replace(result, transport=transport))
         if len(results) != len(requests):
-            results.extend(infra_result(r, "service: no result") for r in requests[len(results):])
+            results.extend(dataclasses.replace(infra_result(r, "service: no result"), transport=transport)
+                           for r in requests[len(results):])
         return results
+
+    def _send(self, body: bytes) -> tuple[dict | None, str | None, dict]:
+        """Post ``body`` until an attempt is not a transport failure, or the attempts or the deadline run out.
+        Returns (payload or None, error, transport)."""
+        end = self.clock() + self.deadline_s
+        reasons: dict[str, int] = {}
+        attempt = 0
+        while True:
+            attempt += 1
+            payload, error, reason = self._attempt(body, max(1e-3, min(self.timeout_s, end - self.clock())))
+            if reason is None:
+                return payload, error, {"attempts": attempt, "reasons": reasons, "gave_up": False}
+            reasons[reason] = reasons.get(reason, 0) + 1
+            delay = self.rng.uniform(0.0, min(self.max_backoff_s, self.backoff_s * 2 ** (attempt - 1)))
+            if attempt >= self.attempts or self.clock() + delay >= end:
+                return None, error, {"attempts": attempt, "reasons": reasons, "gave_up": True}
+            self.sleep(delay)
+
+    def _attempt(self, body: bytes, timeout: float) -> tuple[dict | None, str | None, str | None]:
+        """One post: (payload, None, None) when the service answered, else (None, error, the transport failure's
+        reason, or None for a failure another attempt would not change)."""
+        req = urllib.request.Request(f"{self.url}/v1/execute", data=body,
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                payload = json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            try:
+                detail = error.read()
+            except Exception:  # noqa: BLE001 - an unreadable error body holds no results
+                detail = b""
+            payload = _with_results(detail)
+            if payload is not None:  # results, whatever the status: an answer is never sent again
+                return payload, None, None
+            reason = "http_5xx" if 500 <= error.code < 600 else None
+            return None, f"HTTP {error.code}: {detail[:300].decode('utf-8', 'replace')}", reason
+        except Exception as error:  # noqa: BLE001 - a failed post is an infrastructure error, retried if in transport
+            return None, f"{type(error).__name__}: {error}", _transport_reason(error)
+        if not isinstance(payload, dict):
+            return None, f"malformed answer: {type(payload).__name__}", None
+        return payload, None, None
+
+
+def _with_results(data: bytes) -> dict | None:
+    """The JSON object ``data`` holds when it carries results (the service answered), else None."""
+    try:
+        payload = json.loads(data)
+    except Exception:  # noqa: BLE001
+        return None
+    return payload if isinstance(payload, dict) and isinstance(payload.get("results"), list) else None
+
+
+def _transport_reason(error: BaseException) -> str | None:
+    """``refused``, ``reset`` or ``timeout`` when the connection failed before a response arrived, else None."""
+    if isinstance(error, urllib.error.URLError) and not isinstance(error, urllib.error.HTTPError) \
+            and isinstance(error.reason, BaseException):
+        error = error.reason
+    if isinstance(error, ConnectionRefusedError):
+        return "refused"
+    if isinstance(error, (ConnectionError, http.client.IncompleteRead)):
+        return "reset"
+    if isinstance(error, (TimeoutError, socket.timeout)):
+        return "timeout"
+    return None
 
 
 def _backend_from_args(args: argparse.Namespace) -> Backend:

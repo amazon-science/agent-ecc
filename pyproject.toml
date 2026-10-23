@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-ecc"
-version = "0.2.1"
+version = "0.2.2"
 description = "Version-consistent experience consumption for agent training: validate recorded experience against a chosen verifier version, re-evaluate it when needed, and track what each training step actually consumes."
 readme = "README.md"
 license = "Apache-2.0"

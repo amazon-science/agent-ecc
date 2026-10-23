@@ -86,7 +86,8 @@ class ExecRequest:
 class ExecResult:
     """The raw result of executing one request. ``status`` is ``ok`` (outputs captured; parsing decides whether they
     hold a logical verdict) or ``error`` (infrastructure: no usable outputs). Outputs are stored in the content store
-    and referenced by digest."""
+    and referenced by digest. ``transport`` is how a client obtained the result over a network (``attempts``, failed
+    attempts by ``reasons``, ``gave_up``); it is not part of what was executed, and comparisons ignore it."""
 
     request_id: str
     status: str
@@ -95,31 +96,60 @@ class ExecResult:
     cost: Cost = field(default_factory=Cost)
     error: str | None = None
     schema: str = SCHEMA_RESULT
+    transport: Mapping[str, Any] = field(default_factory=FrozenDict, compare=False)
 
     def __post_init__(self) -> None:
         if self.status not in (RUN_OK, RUN_ERROR):
             raise ValueError(f"unknown result status {self.status!r}")
         object.__setattr__(self, "outputs", _tuple_of(EvidenceRef, self.outputs))
         object.__setattr__(self, "facts", freeze(self.facts))
+        object.__setattr__(self, "transport", freeze(self.transport))
         if not isinstance(self.cost, Cost):
             object.__setattr__(self, "cost", Cost.from_dict(self.cost))
 
     def to_dict(self) -> dict:
-        return {"schema": self.schema, "request_id": self.request_id, "status": self.status,
-                "outputs": [o.to_dict() for o in self.outputs], "facts": thaw(self.facts),
-                "cost": self.cost.to_dict(), "error": self.error}
+        d = {"schema": self.schema, "request_id": self.request_id, "status": self.status,
+             "outputs": [o.to_dict() for o in self.outputs], "facts": thaw(self.facts),
+             "cost": self.cost.to_dict(), "error": self.error}
+        if self.transport:  # a result no transport carried keeps its earlier form
+            d["transport"] = thaw(self.transport)
+        return d
 
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> ExecResult:
         return cls(request_id=d["request_id"], status=d["status"], outputs=d.get("outputs") or (),
                    facts=d.get("facts") or {}, cost=Cost.from_dict(d.get("cost") or {}), error=d.get("error"),
-                   schema=d.get("schema", SCHEMA_RESULT))
+                   schema=d.get("schema", SCHEMA_RESULT), transport=d.get("transport") or {})
 
 
 def infra_result(request: ExecRequest, error: str, *, seconds: float = 0.0) -> ExecResult:
     """An infrastructure failure: no outputs, never a verdict."""
     return ExecResult(request_id=request.request_id, status=RUN_ERROR, error=str(error)[:500],
                       cost=Cost(seconds=seconds))
+
+
+def _gave_up(result: Any) -> bool:
+    """Whether a transport gave up on the result's request after its own retries (no one executes it again)."""
+    return bool((getattr(result, "transport", None) or {}).get("gave_up"))
+
+
+def _add_transport(tally: dict, transport: Mapping[str, Any] | None) -> None:
+    """Count one request's ``ExecResult.transport`` into ``tally`` (requests, attempts, retried, gave_up, reasons)."""
+    if transport:
+        attempts = int(transport.get("attempts") or 0)
+        _merge_transport(tally, {"requests": 1, "attempts": attempts, "retried": int(attempts > 1),
+                                 "gave_up": int(bool(transport.get("gave_up"))), "reasons": transport.get("reasons")})
+
+
+def _merge_transport(tally: dict, other: Mapping[str, Any] | None) -> None:
+    """Add the transport tally ``other`` to ``tally``."""
+    if not other:
+        return
+    for key in ("requests", "attempts", "retried", "gave_up"):
+        tally[key] = tally.get(key, 0) + int(other.get(key) or 0)
+    reasons = tally.setdefault("reasons", {})
+    for reason, n in (other.get("reasons") or {}).items():
+        reasons[reason] = reasons.get(reason, 0) + int(n)
 
 
 @runtime_checkable

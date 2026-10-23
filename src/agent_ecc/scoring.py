@@ -51,9 +51,10 @@ import copy
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol, runtime_checkable
 
+from .canonical import FrozenDict, freeze
 from .compare import Action, Conjunction, Policy, plan_check
 from .records import (
     RUN_ERROR,
@@ -67,7 +68,7 @@ from .records import (
     TestOutcome,
     TestRun,
 )
-from .recompute.base import Backend, ExecRequest, ExecResult, infra_result
+from .recompute.base import Backend, ExecRequest, ExecResult, _add_transport, _gave_up, infra_result
 from .store import ContentStore
 from .versions import Check, Epoch, GraderVersion, iter_checks, spec_digest
 
@@ -165,13 +166,15 @@ class Scored:
 
     ``action`` is reuse, reparse, reexec, undeterminable, ungoverned, or pending (the strongest action needed exceeded
     ``allow``; ``required`` names it and no score is produced). ``short_circuit`` is true when a logical fail decided
-    the conjunction while some of its checks were never evaluated."""
+    the conjunction while some of its checks were never evaluated. ``transport`` tallies the requests first charged
+    to this record that a transport carried: ``requests``, ``attempts``, ``retried``, ``gave_up`` and ``reasons``."""
 
     execution_id: str
     score: ScoreRecord | None
     action: str
     required: str | None = None
     short_circuit: bool = False
+    transport: Mapping[str, Any] = field(default_factory=FrozenDict, compare=False)
 
 
 @dataclass
@@ -208,6 +211,7 @@ class _State:
     result: Scored | None = None
     costs: list = field(default_factory=list)  # per check of the conjunction, in order
     version_id: str | None = None
+    transport: dict = field(default_factory=dict)  # the transport tally of the requests first charged to it
 
 
 _METHOD_ACTION = {Method.RECORDED: "reuse", Method.REPARSE: "reparse", Method.REEXEC: "reexec",
@@ -221,12 +225,12 @@ RECORDED_UNDETERMINABLE = "recorded_undeterminable"
 class Scorer:
     """Scores records under grader versions.
 
-    ``adapters`` maps a family name to its adapter; ``store`` holds evidence; ``backend`` executes re-execution
-    requests (without one, a check that needs an execution is undeterminable). ``retries`` is the number of further
-    executions after an execution that gave no logical verdict. ``recorded_infra`` says what a recorded run that hit
-    an infrastructure error leads to (``"reexec"`` or ``"undeterminable"``). ``short_circuit`` (default) stops
-    evaluating a conjunction at its first logical fail; False evaluates every check. ``cache`` may be a dict shared
-    between calls: request id -> result, for results that gave their check a logical verdict.
+    ``adapters`` maps a family name to its adapter; ``store`` holds evidence; ``backend`` executes re-execution requests
+    (without one, a check that needs an execution is undeterminable). ``retries`` is the number of further executions
+    after one without a logical verdict, unless the backend's transport gave up on it. ``recorded_infra`` says what a
+    recorded run that hit an infrastructure error leads to (``"reexec"`` or ``"undeterminable"``). ``short_circuit``
+    (default) stops evaluating a conjunction at its first logical fail; False evaluates every check. ``cache`` may be a
+    dict shared between calls: request id -> result, for results that gave their check a logical verdict.
 
     ``recorded_undeterminable`` says what a record whose recorded verdict is undeterminable as a whole leads to (the
     recorded verdict: the first earlier score that was recorded and not derived from another, otherwise the first
@@ -342,12 +346,15 @@ class Scorer:
                 result = results[rid]
                 first = rid not in charged
                 charged.add(rid)
+                if first:
+                    _add_transport(w.state.transport, getattr(result, "transport", None))
                 if self._on_result(w, result, first) and result.status == RUN_OK:
                     local[rid] = result
                     if self.cache is not None:
                         with self._cache_lock:
                             self.cache[rid] = result
-        return [st.result for st in states]  # type: ignore[misc]
+        return [replace(st.result, transport=freeze(st.transport)) if st.transport else st.result  # type: ignore
+                for st in states]
 
     def score_one(self, item: ScoreInput | ExecutionRecord, version: GraderVersion | Epoch) -> Scored:
         return self.score([item], version)[0]
@@ -675,7 +682,8 @@ class Scorer:
                                        seconds=total), job.index)
             st.queue.pop(0)
             return True
-        if w.attempts <= self.retries and not verdict.final:
+        # a transport failure is retried by the transport alone (with backoff, in its deadline): never again here
+        if w.attempts <= self.retries and not verdict.final and not _gave_up(result):
             st.retry = w
             return False
         st.conj.resolve(self._part(job.check, verdict, Method.UNDETERMINABLE, run=run, attempts=w.attempts,

@@ -48,6 +48,7 @@ is re-verified under every target spec, sharing executions through the scorer's 
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import enum
 import json
@@ -73,6 +74,7 @@ from .records import (
     TargetPin,
     load_jsonl,
 )
+from .recompute.base import _merge_transport
 from .scoring import ScoreInput, Scorer, _recorded_score
 from .versions import Epoch, iter_checks
 
@@ -313,6 +315,7 @@ class SealSession:
         self._issued: dict[str, list[GroupDecision]] = {}
         self._lock = threading.Lock()
         self._decide_s = 0.0
+        self._transport: dict = {}  # how this seal's own executions went over a transport (Scored.transport)
         self._finished = False
 
     @property
@@ -391,6 +394,9 @@ class SealSession:
             to_score = [(i, m) for i, (_, m) in enumerate(flat) if m.execution is not None]
             inputs = [ScoreInput(m.execution, m.prior) for _, m in to_score]  # type: ignore[arg-type]
             scored = self.scorer.score(inputs, self.epoch)  # the epoch (publication and body): its identity binds
+            with self._lock:
+                for s in scored:
+                    _merge_transport(self._transport, getattr(s, "transport", None))
             for (i, m), s in zip(to_score, scored):
                 if s.score is not None:
                     self.scores.append(s.score)
@@ -676,7 +682,8 @@ class SealSession:
         return SealDecision(seal_id=self.seal_id, epoch=self.epoch_ref, mode=self.mode.value, policy=self.policy,
                             strict=self.strict, groups=tuple(out), batch_id=self.batch_id, excluded=(),
                             target_groups=len(out), rounds=self.rounds, failed=reason, opened_at=self.opened_at,
-                            closed_at=self.clock(), stats=freeze({"groups": len(out)}), target_pin=self.target_pin)
+                            closed_at=self.clock(), stats=freeze({"groups": len(out), **self._transport_stats()}),
+                            target_pin=self.target_pin)
 
     def _stats(self, groups: Sequence[GroupDecision], excluded: Sequence[Exclusion],
                info: Mapping[str, Any]) -> FrozenDict:
@@ -705,7 +712,13 @@ class SealSession:
         if self._prepared_view is not None:
             # how every request this seal would have executed was answered: by a prepared result, or at the seal
             stats["prepared"] = self._prepared_view.summary()
+        stats.update(self._transport_stats())
         return freeze(stats)
+
+    def _transport_stats(self) -> dict:
+        """``{"transport": tally}`` when this seal's executions went over a transport (attempts, retries, by reason)."""
+        with self._lock:
+            return {"transport": copy.deepcopy(self._transport)} if self._transport else {}
 
 
 class Arm(str, enum.Enum):

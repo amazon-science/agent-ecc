@@ -70,7 +70,7 @@ from typing import Any
 
 from .compare import Action
 from .records import RUN_OK
-from .recompute.base import ExecRequest, ExecResult, infra_result
+from .recompute.base import ExecRequest, ExecResult, _gave_up, infra_result
 from .scoring import ScoreInput, Scorer
 from .seal import Candidate, Member
 from .versions import Check, Epoch, iter_checks
@@ -659,7 +659,7 @@ class Preparer:
                 result = self._execute_once(job.request)
                 job.attempts += 1
                 usable, final = self._judge(job, result)
-                if usable or final or job.attempts > self.scorer.retries:
+                if usable or final or job.attempts > self.scorer.retries or _gave_up(result):  # as the scorer does
                     break
         except Exception as exc:  # noqa: BLE001 - a failed job is executed at the seal instead
             result, error = None, f"{type(exc).__name__}: {exc}"[:300]

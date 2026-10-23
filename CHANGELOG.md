@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.2.2 (2026-10-23)
+
+* **Transport retries** in the reference service's client (`HTTPBackend`): a post that fails in transport (a
+  connection reset or refused, a timeout before a response, an HTTP 5xx without results) is sent again, unchanged,
+  after a full-jitter backoff (`backoff_s=1.0`, doubling, at most `max_backoff_s=30.0`), for at most `attempts=3` posts
+  within one deadline per post (`deadline_s`, default `timeout_s`, which also bounds each attempt). An answer that
+  holds results is never sent again, whatever its verdicts or its status. Every post carries the same requests, so the
+  request ids, and the keys a scorer's cache files results under, are those of a single post. A failure that outlasts
+  the attempts or the deadline is an infrastructure error, as before: the check is undeterminable and a repair seal
+  neutralizes the member's group. Before, the client turned a transport failure into an infrastructure error at once,
+  and only the scorer's `retries` executed the request again, without waiting, so retries met the same burst of
+  connection resets (a server's small listen backlog) that caused the failure.
+* Transport failures are retried in one place: the scorer, and a preparer's jobs, no longer execute again a request
+  whose transport gave up (`retries` still applies to every other result without a logical verdict), so attempts do
+  not multiply and one deadline bounds the request.
+* `ExecResult.transport` records how a client obtained a result: `attempts`, failed attempts by `reasons` (`reset`,
+  `refused`, `timeout`, `http_5xx`) and `gave_up`. A recording holds it only when it is set, so a result no transport
+  carried keeps its 0.2.1 form, and comparisons ignore it. `Scored.transport` tallies the requests first charged to a
+  record, and a seal whose executions went over a transport has `stats["transport"]`: `requests`, `attempts`,
+  `retried`, `gave_up` and `reasons`, counted per request (a post that carries n requests counts n times).
+* Tests: a raw-socket service that resets the first connections, one that always resets, answers with results (a pass
+  and a fail, under status 200 and 503) that are never sent again, 4xx and 5xx answers, refused connections, timeouts
+  and the deadline, the seal's statistics with a kept and a neutralized group, and a recording replayed without a
+  second retry.
+
 ## 0.2.1 (2026-10-21)
 
 * Example `examples/posthoc`: a sidecar's evidence is read only when its outcome digest (the trainer's capture of the
