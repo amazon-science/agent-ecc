@@ -42,6 +42,7 @@ from .base import Backend, ExecRequest, ExecResult, RecordedBackend, infra_resul
 __all__ = ["HTTPBackend", "ReferenceService", "main", "make_server"]
 
 MAX_BODY = 512 * 1024 * 1024
+BACKLOG = 1024  # the listen queue: socketserver's default of 5 drops or resets a burst of connections
 
 
 class ReferenceService:
@@ -82,8 +83,10 @@ class ReferenceService:
         return {"results": [r.to_dict() for r in results], "objects": objects, "seconds": time.time() - t0}
 
 
-def make_server(service: ReferenceService, host: str = "127.0.0.1", port: int = 8770) -> ThreadingHTTPServer:
-    """An HTTP server for ``service`` (call ``serve_forever()``; port 0 picks a free port)."""
+def make_server(service: ReferenceService, host: str = "127.0.0.1", port: int = 8770, *,
+                backlog: int = BACKLOG) -> ThreadingHTTPServer:
+    """An HTTP server for ``service`` (call ``serve_forever()``; port 0 picks a free port) that queues up to
+    ``backlog`` connections not yet accepted (the kernel may cap it: ``net.core.somaxconn`` on Linux)."""
 
     class Handler(BaseHTTPRequestHandler):
         def _send(self, code: int, payload: dict) -> None:
@@ -116,9 +119,11 @@ def make_server(service: ReferenceService, host: str = "127.0.0.1", port: int = 
         def log_message(self, fmt, *args):  # quiet by default
             return
 
-    server = ThreadingHTTPServer((host, port), Handler)
-    server.daemon_threads = True
-    return server
+    class Server(ThreadingHTTPServer):
+        request_queue_size = max(1, int(backlog))  # read when the socket starts listening, in the constructor
+        daemon_threads = True
+
+    return Server((host, port), Handler)
 
 
 class HTTPBackend:
@@ -285,13 +290,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap.add_argument("--store", default=None, help="a directory store for objects (default: in memory)")
     ap.add_argument("--backend", choices=("swebench-docker", "appworld", "recorded"), required=True)
     ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--backlog", type=int, default=BACKLOG, help="connections queued before they are accepted")
     ap.add_argument("--timeout", type=float, default=1800.0, help="eval-script timeout (swebench-docker)")
     ap.add_argument("--appworld-data", action="append", default=[], metavar="VERSION=DIR")
     ap.add_argument("--recorded", default=None, help="JSON-lines of recorded results (recorded)")
     args = ap.parse_args(argv)
     store = DirectoryStore(args.store) if args.store else MemoryStore()
     service = ReferenceService(_backend_from_args(args), store, workers=args.workers, name=args.backend)
-    server = make_server(service, args.host, args.port)
+    server = make_server(service, args.host, args.port, backlog=args.backlog)
     print(f"[agent-ecc] re-verification service on {args.host}:{server.server_address[1]} "
           f"({args.backend}, {args.workers} workers)", flush=True)
     try:

@@ -334,8 +334,13 @@ One result per request, in order; a failed execution is an `ExecResult` with `st
 
 ```
 python -m agent_ecc.recompute.service --backend {swebench-docker,appworld,recorded} [--port 8770] [--store DIR]
-                                      [--workers N] [--timeout S] [--appworld-data VERSION=DIR ...] [--recorded FILE]
+                                      [--workers N] [--backlog 1024] [--timeout S] [--appworld-data VERSION=DIR ...]
+                                      [--recorded FILE]
 ```
+
+The server (`make_server(service, host, port, backlog=1024)`) queues up to `backlog` connections it has not accepted
+yet; socketserver's default of 5 drops or resets a burst of concurrent connections before any request is read. The
+kernel may cap the queue (`net.core.somaxconn` on Linux).
 
 * `GET /v1/health` -> `{"ok": true, "served": n, "backend": name, "workers": n}`
 * `POST /v1/execute` with `{"requests": [ExecRequest...], "objects": {digest: base64}}` ->

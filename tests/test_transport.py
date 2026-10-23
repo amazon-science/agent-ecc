@@ -1,12 +1,13 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The reference service's client retries transport failures; the scorer and the seal account for the retries."""
+"""The reference service's listen backlog, its client's transport retries, and what the scorer and the seal record."""
 
 import dataclasses
 import json
 import socket
 import struct
+import sys
 import threading
 
 import pytest
@@ -14,7 +15,7 @@ import pytest
 from agent_ecc.canonical import thaw
 from agent_ecc.records import Outcome, SealDecision
 from agent_ecc.recompute.base import ExecResult, RecordedBackend, RecordingBackend
-from agent_ecc.recompute.service import HTTPBackend, ReferenceService
+from agent_ecc.recompute.service import BACKLOG, HTTPBackend, ReferenceService, make_server
 from agent_ecc.scoring import ScoreInput, Scorer, grade_recorded
 from agent_ecc.seal import Candidate, Member, SealSession
 from agent_ecc.store import MemoryStore
@@ -257,3 +258,56 @@ def test_transport_is_recorded_and_a_replay_does_not_retry_a_give_up(fake, tmp_p
     bare = dataclasses.replace(result, transport={})
     assert result == bare and ExecResult.from_dict(result.to_dict()).transport == result.transport
     assert "transport" not in bare.to_dict()  # a result no transport carried keeps its earlier form
+
+
+def _connect(port, n, timeout_s):
+    """Open up to ``n`` connections to a server that accepts none yet, stopping at the first that cannot connect."""
+    socks = []
+    for _ in range(n):
+        try:
+            socks.append(socket.create_connection(("127.0.0.1", port), timeout=timeout_s))
+        except OSError:
+            break
+    return socks
+
+
+def test_the_service_serves_a_burst_beyond_socketservers_default_backlog_of_5():
+    server = make_server(ReferenceService(ToyBackend(), MemoryStore(), name="toy"), "127.0.0.1", 0)
+    assert server.request_queue_size == BACKLOG == 1024
+    socks, serving = _connect(server.server_address[1], 20, 2.0), None  # 20 pending at once: none is accepted yet
+    try:
+        assert len(socks) == 20
+        for s in socks:
+            s.sendall(b"GET /v1/health HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+        serving = threading.Thread(target=server.serve_forever, daemon=True)
+        serving.start()
+        replies = []
+        for s in socks:
+            data = b""
+            while True:
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+            replies.append(data.split(b"\r\n", 1)[0])
+        assert replies == [b"HTTP/1.0 200 OK"] * 20
+    finally:
+        for s in socks:
+            s.close()
+        if serving is not None:
+            server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux's listen-queue overflow")
+def test_a_backlog_of_5_cannot_hold_the_burst():
+    server = make_server(ReferenceService(ToyBackend(), MemoryStore()), "127.0.0.1", 0, backlog=5)
+    socks = []
+    try:
+        assert server.request_queue_size == 5
+        socks = _connect(server.server_address[1], 20, 0.3)
+        assert len(socks) < 20  # the queue is full (6 on Linux): the next handshake does not complete
+    finally:
+        for s in socks:
+            s.close()
+        server.server_close()

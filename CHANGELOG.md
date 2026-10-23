@@ -12,6 +12,9 @@
   neutralizes the member's group. Before, the client turned a transport failure into an infrastructure error at once,
   and only the scorer's `retries` executed the request again, without waiting, so retries met the same burst of
   connection resets (a server's small listen backlog) that caused the failure.
+* The reference service listens with a **backlog of 1024** (`make_server(..., backlog=1024)`, `--backlog`):
+  socketserver's default of 5 let a burst of concurrent connections overflow the queue, which drops or resets them
+  before any request is read.
 * Transport failures are retried in one place: the scorer, and a preparer's jobs, no longer execute again a request
   whose transport gave up (`retries` still applies to every other result without a logical verdict), so attempts do
   not multiply and one deadline bounds the request.
@@ -23,7 +26,8 @@
 * Tests: a raw-socket service that resets the first connections, one that always resets, answers with results (a pass
   and a fail, under status 200 and 503) that are never sent again, 4xx and 5xx answers, refused connections, timeouts
   and the deadline, the seal's statistics with a kept and a neutralized group, and a recording replayed without a
-  second retry.
+  second retry; a burst of 20 connections the service has not accepted yet, all served (and, on Linux, one that a
+  backlog of 5 cannot hold).
 
 ## 0.2.1 (2026-10-21)
 
