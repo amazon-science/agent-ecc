@@ -363,6 +363,9 @@ class Scorer:
 
     def _start(self, index: int, item: ScoreInput, version: GraderVersion) -> _State:
         record = item.execution
+        for score in item.prior:  # on every path: an ungoverned record's recorded verdict is taken from its prior too
+            if score.execution_id != record.record_id:
+                raise ValueError(f"prior score {score.score_id} is for another execution")
         st = _State(index=index, item=item, record=record, version_id=version.version_id)
         st.adapter = self.adapters.get(record.family)
         if st.adapter is None:
@@ -382,8 +385,6 @@ class Scorer:
         st.costs = [Cost() for _ in st.conj.checks]
         st.spec_digest = spec_digest(lookup.spec)
         for score in item.prior:
-            if score.execution_id != record.record_id:
-                raise ValueError(f"prior score {score.score_id} is for another execution")
             for part in score.parts:
                 st.parts_prior.append(part)
                 st.part_source[id(part)] = score.score_id

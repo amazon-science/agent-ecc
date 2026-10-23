@@ -1,8 +1,10 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The post hoc example's outcome-digest check: a sidecar whose digest is missing or does not bind its trajectory to
-the patch its evidence names is unrepairable, and its evidence is never read."""
+"""The post hoc example's integrity checks on the trainer's sidecars. A sidecar whose outcome digest is missing or does
+not bind its trajectory to the patch its evidence names is unrepairable, and so is one whose evidence binding (the
+digest of the whole sidecar) is missing or no longer matches: its evidence is never read. Both checks cover every
+sidecar."""
 
 import hashlib
 import json
@@ -28,6 +30,20 @@ def _capture_digest(sc: dict) -> str:
     return "sha256:" + hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
+def _binding_digest(sc: dict) -> str:
+    """The trainer's evidence binding, written independently of the example's: the sidecar but its volatile fields,
+    as canonical JSON of {"v": 1, "sidecar": ...}."""
+    body = {k: v for k, v in sc.items() if k not in ("events", "timing", "evidence_binding")}
+    payload = json.dumps({"v": 1, "sidecar": json.loads(json.dumps(body, sort_keys=True, default=str))},
+                         sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _rebind(sc: dict) -> dict:
+    sc["evidence_binding"] = {"version": 1, "digest": _binding_digest(sc)}
+    return sc
+
+
 def _put(root, data: bytes) -> dict:
     digest = digest_bytes(data)
     path = posthoc.artifact_path(root, digest)
@@ -49,7 +65,9 @@ def _sidecar(root, i, patch, statuses, spec):
           "verdict": {"resolved": resolved, "valid": True, "reason": None if resolved else "tests_failed"},
           "graded_epoch": {"epoch": 0, "name": "e0", "covered": True}}
     sc["outcome_digest"] = _capture_digest(sc)
-    return sc
+    sc["task"]["base_commit"] = "0123abcd"
+    sc["events"], sc["timing"] = {"persist_t": 1.0}, {"grade_s": 2.0}  # written after the verdict: not bound
+    return _rebind(sc)
 
 
 @pytest.fixture
@@ -115,6 +133,7 @@ def test_records_with_their_own_evidence_are_scored(run, tmp_path):
     summary, outcomes, _ = _main(run, tmp_path)
     assert outcomes == {"0/a0": "pass", "1/a0": "fail"}
     assert summary["records"]["outcome_digest"] == {"checked": True, "unrepairable": 0}
+    assert summary["records"]["evidence_binding"] == {"checked": True, "unrepairable": 0}
 
 
 def test_a_patch_and_log_swapped_with_another_record_fail_closed(run, tmp_path):
@@ -139,9 +158,12 @@ def test_a_missing_outcome_digest_fails_closed_and_the_check_can_be_turned_off(r
     assert outcomes == {"0/a0": "pass", "1/a0": "undeterminable"}
     assert summary["records"]["outcome_digest"] == {"checked": True, "unrepairable": 1, "missing": 1}
 
+    _rebind(sc)  # a run whose sidecars record a binding but no outcome digest
+    _write(run, 1, sc)
     summary, outcomes, _ = _main(run, tmp_path / "off", "--no-outcome-digest")
     assert outcomes == {"0/a0": "pass", "1/a0": "fail"}
     assert summary["records"]["outcome_digest"] == {"checked": False, "unrepairable": 0}
+    assert summary["records"]["evidence_binding"] == {"checked": True, "unrepairable": 0}
 
 
 def test_the_outcome_digest_check_reads_the_sidecar_only():
@@ -154,3 +176,89 @@ def test_the_outcome_digest_check_reads_the_sidecar_only():
         assert posthoc.outcome_digest_check({**sc, **change}) == "mismatch"
     assert posthoc.outcome_digest_check({**sc, "outcome_digest": ""}) == "missing"
     assert posthoc.outcome_digest_check(None) == "missing"
+
+
+# ---------------------------------------------------------------------------------------------- the evidence binding
+
+
+def _mutate(root, i, change):
+    sc = _read(root, i)
+    change(sc)
+    _write(root, i, sc)  # the stored binding is left as it was: a sidecar edited on disk after it was written
+
+
+def _flip_suite_class(sc):
+    suite = sc["evidence"]["suites"][0]
+    suite["class"] = "fail" if suite["class"] == "pass" else "pass"
+
+
+CORRUPTIONS = {
+    "suite class flipped": _flip_suite_class,
+    "execution configuration changed": lambda sc: sc["stamps"]["specs"][0].update(
+        {"apply_cmds": "sha256:" + "ab" * 32}),
+    "base commit marker": lambda sc: sc["task"].update({"base_commit": sc["task"]["base_commit"] + "~CORRUPT"}),
+    "verdict changed": lambda sc: sc["verdict"].update({"resolved": not sc["verdict"]["resolved"]}),
+    "log reference swapped": lambda sc: sc["evidence"]["suites"][0].update(
+        {"test_log": {"digest": "sha256:" + "cd" * 32, "size": 1}}),
+    "binding removed": lambda sc: sc.pop("evidence_binding"),
+    "binding of another version": lambda sc: sc["evidence_binding"].update({"version": 2}),
+}
+
+
+@pytest.mark.parametrize("attempt", [0, 1])  # a resolved attempt and a failed one: every sidecar is checked
+@pytest.mark.parametrize("name", sorted(CORRUPTIONS))
+def test_a_sidecar_edited_after_it_was_written_fails_closed(run, tmp_path, name, attempt):
+    """None of these touches what the outcome digest binds (the trajectory, the status and the patch's digest)."""
+    _mutate(run, attempt, CORRUPTIONS[name])
+
+    summary, outcomes, records = _main(run, tmp_path)
+
+    kept = f"{1 - attempt}/a0"
+    assert outcomes[f"{attempt}/a0"] == "undeterminable" and outcomes[kept] == ("pass", "fail")[1 - attempt]
+    assert records[f"{attempt}/a0"]["artifacts"] == [] and records[f"{attempt}/a0"]["runs"] == []  # never read
+    assert records[kept]["artifacts"] and records[kept]["runs"]
+    assert summary["records"]["outcome_digest"] == {"checked": True, "unrepairable": 0}  # the digest never saw it
+    want = {"missing": 1} if name.startswith("binding") else {"mismatch": 1}
+    assert summary["records"]["evidence_binding"] == {"checked": True, "unrepairable": 1, **want}
+
+
+def test_a_sidecar_that_fails_both_checks_is_rejected_for_its_outcome_digest(run, tmp_path):
+    def swap_evidence(sc):
+        sc["evidence"] = _read(run, 1)["evidence"]  # another record's patch and log, binding untouched
+
+    _mutate(run, 0, swap_evidence)
+    summary, outcomes, _ = _main(run, tmp_path)
+    assert outcomes == {"0/a0": "undeterminable", "1/a0": "fail"}
+    assert summary["records"]["outcome_digest"] == {"checked": True, "unrepairable": 1, "mismatch": 1}
+    assert summary["records"]["evidence_binding"] == {"checked": True, "unrepairable": 1, "mismatch": 1}
+
+
+def test_volatile_fields_do_not_move_the_binding_and_old_runs_can_skip_it(run, tmp_path):
+    _mutate(run, 0, lambda sc: sc.update({"events": {"persist_t": 99.0}, "timing": {"grade_s": 9.0}}))
+    summary, outcomes, _ = _main(run, tmp_path)
+    assert outcomes == {"0/a0": "pass", "1/a0": "fail"}
+    assert summary["records"]["evidence_binding"] == {"checked": True, "unrepairable": 0}
+
+    _mutate(run, 0, lambda sc: sc.pop("evidence_binding"))  # a run from before the trainer recorded bindings
+    summary, outcomes, _ = _main(run, tmp_path / "off", "--no-evidence-binding")
+    assert outcomes == {"0/a0": "pass", "1/a0": "fail"}
+    assert summary["records"]["evidence_binding"] == {"checked": False, "unrepairable": 0}
+
+
+def test_the_binding_digest_equals_the_trainers():
+    """A fixed sidecar and the digest the trainer's own function gives it (a float, non-ASCII text, volatile fields)."""
+    sc = {"schema": "swe-bench-sidecar/2", "task_id": TASK, "trajectory_id": "request:7:attempt:0",
+          "stamps": {"image": "registry/img@sha256:ab", "specs": [{"name": "s0", "labels": "sha256:cd"}]},
+          "task": {"repo": "pkg/pkg", "version": "1.0", "base_commit": "0123abcd"},
+          "evidence": {"agent_patch": {"digest": "sha256:ee", "size": 12}, "suites": [{"name": "s0", "class": "pass"}]},
+          "verdict": {"resolved": True, "valid": True, "reason": None, "ratio": 0.5, "note": "caf\u00e9"},
+          "events": {"persist_t": 1.0}, "timing": {"grade_s": 2.0}}
+    golden = "sha256:510785f3768ca3a6a827d5667edf573750ec9cf2852482e6cf4d43a950055570"
+    assert posthoc.evidence_binding_digest(sc) == golden == _binding_digest(sc)
+    assert posthoc.evidence_binding_digest({**sc, "events": {"persist_t": 99.0}}) == golden
+    sc["evidence_binding"] = {"version": 1, "digest": golden}
+    assert posthoc.evidence_binding_check(sc) == "ok"
+    assert posthoc.evidence_binding_check({**sc, "task": {**sc["task"], "base_commit": "0123abce"}}) == "mismatch"
+    assert posthoc.evidence_binding_check({**sc, "evidence_binding": {"version": 2, "digest": golden}}) == "missing"
+    assert posthoc.evidence_binding_check({k: v for k, v in sc.items() if k != "evidence_binding"}) == "missing"
+    assert posthoc.evidence_binding_check(None) == "missing"

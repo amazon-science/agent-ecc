@@ -28,6 +28,23 @@
   and the deadline, the seal's statistics with a kept and a neutralized group, and a recording replayed without a
   second retry; a burst of 20 connections the service has not accepted yet, all served (and, on Linux, one that a
   backlog of 5 cannot hold).
+* **Post hoc example: the trainer's evidence binding.** `examples/posthoc` already read a sidecar's evidence only
+  when its outcome digest matched, but that digest binds the trajectory, the attempt, the status and the patch's digest
+  and nothing else: a changed suite class, base commit, execution stamp, log reference or verdict passed it, and the
+  record was scored, exported and compared as the sidecar said. A sidecar is now also unrepairable (no evidence read,
+  an undeterminable recorded verdict) when its `evidence_binding`, the trainer's digest of the whole sidecar but its
+  volatile fields (`events`, `timing`), is missing, of another version, or no longer matches. Like the outcome digest it
+  covers every sidecar, whatever the seal later did with it; when both checks fail the outcome digest is the reason
+  kept. `--no-evidence-binding` reads runs whose sidecars record none; `summary.records.evidence_binding` counts the
+  sidecars it rejected. It proves a sidecar is unchanged since it was written, not that its grading was right.
+* **Scorer: a prior score of another execution is refused on every path.** `Scorer.score` raised for a prior score
+  whose `execution_id` is not the record's only for records the version governs; for a task it does not govern (whose
+  recorded verdict is taken from the prior score), an unknown world, a torn observation or a family no adapter serves
+  the check was skipped. It now runs first, for every item.
+* Tests: seven corruptions of a stored sidecar (a suite class flipped, the execution stamps changed, a base-commit
+  marker, the verdict changed, a log reference swapped, the binding removed, a binding of another version), each on a
+  resolved and on a failed attempt; a sidecar failing both checks; volatile fields; the example's digest against a
+  fixed digest computed by the trainer's function; and a foreign prior score on each path the scorer can take.
 
 ## 0.2.1 (2026-10-21)
 

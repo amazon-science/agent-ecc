@@ -11,7 +11,9 @@ everything with agent-ecc, and checks what the lifecycle promises:
 1. **Records.** Every graded trajectory attempt the trainer's seal would read becomes an ``ExecutionRecord`` (its
    patch and the suite runs made when it was graded, by digest), and its recorded verdict a ``ScoreRecord``. Every
    evidence object is read once and verified against its digest. A sidecar whose outcome digest is missing or does
-   not bind its trajectory to the patch its evidence names is unrepairable: its evidence is never read.
+   not bind its trajectory to the patch its evidence names, or whose evidence binding (the trainer's digest of the
+   whole sidecar: patch, log references, execution configuration and verdict) is missing or no longer matches, is
+   unrepairable: its evidence is never read. Both checks cover every sidecar, whatever the seal later did with it.
 2. **Versions.** Every published grader epoch becomes a ``GraderVersion`` built by the SWE-bench adapter from the
    epoch's own objects; every identity agent-ecc derives is compared with the one the epoch body names. The
    publication log is replayed into a ``DirectoryRegistry`` at the logged times.
@@ -58,6 +60,7 @@ its source tree).
 
 Run:  python examples/posthoc/run.py --run RUN_DIR --out OUT [--executions DIR ...] [--name NAME] [--swebench PATH]
       [--no-outcome-digest] (for runs whose sidecars record no outcome digest)
+      [--no-evidence-binding] (for runs whose sidecars record no evidence binding)
 """
 
 from __future__ import annotations
@@ -331,15 +334,43 @@ def outcome_digest_check(sc: dict | None) -> str:
     return "ok" if outcome_digest(sc) == sc["outcome_digest"] else "mismatch"
 
 
-def unrepairable_record(record_id: str, sc: dict, check: str) -> tuple[ExecutionRecord, ScoreRecord]:
-    """A sidecar that failed the outcome-digest check: a record without its evidence (no patch, no runs, so nothing is
-    re-parsed or re-executed for it) and an undeterminable recorded verdict."""
+BINDING_FIELD = "evidence_binding"
+BINDING_VERSION = 1
+BINDING_VOLATILE = ("events", "timing", BINDING_FIELD)  # written after the verdict, or rewritten by readers
+
+
+def evidence_binding_digest(sc: dict) -> str:
+    """The evidence binding the trainer's adapter records when it writes a sidecar: the digest of the whole sidecar
+    (identity, outcome digest, stamps, graded epoch, every evidence reference, verdict, the task record) except its
+    volatile fields, as the sidecar is written to disk (``default=str``), in canonical JSON."""
+    body = json.loads(json.dumps({k: v for k, v in sc.items() if k not in BINDING_VOLATILE}, sort_keys=True,
+                                 default=str))
+    payload = json.dumps({"v": BINDING_VERSION, "sidecar": body}, sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(payload.encode()).hexdigest()
+
+
+def evidence_binding_check(sc: dict | None) -> str:
+    """"ok", "missing" (no binding recorded, or another version) or "mismatch": the sidecar's ``evidence_binding``
+    vs :func:`evidence_binding_digest`. It catches any change to a stored sidecar since it was written, including the
+    fields a record's score is built from (a suite's class, the stamps, the verdict), which the outcome digest does
+    not bind."""
+    binding = (sc or {}).get(BINDING_FIELD) or {}
+    if not binding.get("digest") or binding.get("version") != BINDING_VERSION:
+        return "missing"
+    return "ok" if evidence_binding_digest(sc) == binding["digest"] else "mismatch"
+
+
+def unrepairable_record(record_id: str, sc: dict, check: str,
+                        what: str = "outcome digest") -> tuple[ExecutionRecord, ScoreRecord]:
+    """A sidecar that failed the outcome-digest (or, ``what="evidence binding"``, the evidence-binding) check: a record
+    without its evidence (no patch, no runs, so nothing is re-parsed or re-executed for it) and an undeterminable
+    recorded verdict."""
     stamps = sc.get("stamps") or {}
     record = ExecutionRecord(family="swebench", task_id=str(sc.get("task_id")), trajectory_id=record_id,
                              world_version=None if stamps.get("image") is None else str(stamps["image"]),
-                             facts={"outcome_digest": check})
+                             facts={what.replace(" ", "_"): check})
     return record, ScoreRecord(execution_id=record.record_id, grader_version=None, outcome=Outcome.UNDETERMINABLE,
-                               method=Method.UNDETERMINABLE, reason=f"unrepairable: outcome digest {check}",
+                               method=Method.UNDETERMINABLE, reason=f"unrepairable: {what} {check}",
                                meta={"source": "sidecar"})
 
 
@@ -518,6 +549,8 @@ def main(argv=None) -> dict:
     ap.add_argument("--threads", type=int, default=64, help="parallel file reads")
     ap.add_argument("--no-outcome-digest", action="store_true",
                     help="skip the outcome-digest check (runs whose sidecars record no outcome digest)")
+    ap.add_argument("--no-evidence-binding", action="store_true",
+                    help="skip the evidence-binding check (runs whose sidecars record no evidence binding)")
     args = ap.parse_args(argv)
     if args.swebench:
         sys.path.insert(0, os.path.abspath(args.swebench))
@@ -568,9 +601,16 @@ def main(argv=None) -> dict:
                 raise SystemExit(f"{path}: unknown sidecar schema {sc.get('schema')!r}")
             sidecars[rid] = sc
     del raw
-    # a sidecar's evidence is read only if its outcome digest binds its trajectory to the patch it names
+    # a sidecar's evidence is read only if its outcome digest binds its trajectory to the patch it names and its
+    # evidence binding says it is the sidecar that was written; both checks cover every sidecar, whatever its status
     digest_check = {rid: "ok" if args.no_outcome_digest else outcome_digest_check(sc) for rid, sc in sidecars.items()}
-    rejected = {rid: c for rid, c in digest_check.items() if c != "ok"}
+    binding_check = {rid: "ok" if args.no_evidence_binding else evidence_binding_check(sc)
+                     for rid, sc in sidecars.items()}
+    rejected_digest = {rid: c for rid, c in digest_check.items() if c != "ok"}
+    rejected_binding = {rid: c for rid, c in binding_check.items() if c != "ok"}
+    # rid -> (the check that failed first, its result): the outcome digest is read first
+    rejected = {**{rid: ("evidence binding", c) for rid, c in rejected_binding.items()},
+                **{rid: ("outcome digest", c) for rid, c in rejected_digest.items()}}
 
     # evidence: every object the records, the seals' and the later re-executions name, read once and verified
     sources = [("run", root)] + [(f"posthoc{i}", os.path.abspath(d)) for i, d in enumerate(args.executions)]
@@ -658,7 +698,7 @@ def main(argv=None) -> dict:
     by_traj = {}
     for rid in sorted(sidecars, key=lambda r: (int(r.split("/a")[0]) if r.split("/a")[0].isdigit() else 0, r)):
         if rid in rejected:
-            record, score = unrepairable_record(rid, sidecars[rid], rejected[rid])
+            record, score = unrepairable_record(rid, sidecars[rid], rejected[rid][1], rejected[rid][0])
         else:
             record, score = record_from_sidecar(rid, sidecars[rid], version_of_epoch)
         records.append(record)
@@ -678,8 +718,11 @@ def main(argv=None) -> dict:
         "evidence_objects": len(wanted) - len(missing) - len(corrupt), "evidence_bytes": nbytes,
         "evidence_missing": len(missing), "evidence_corrupt": len(corrupt),
         "records_jsonl_sha256": records_sha,
-        "outcome_digest": {"checked": not args.no_outcome_digest, "unrepairable": len(rejected),
-                           **{k: v for k, v in sorted(Counter(rejected.values()).items())}},
+        "outcome_digest": {"checked": not args.no_outcome_digest, "unrepairable": len(rejected_digest),
+                           **{k: v for k, v in sorted(Counter(rejected_digest.values()).items())}},
+        # the sidecars it rejected, whether or not the outcome digest rejected them too
+        "evidence_binding": {"checked": not args.no_evidence_binding, "unrepairable": len(rejected_binding),
+                             **{k: v for k, v in sorted(Counter(rejected_binding.values()).items())}},
     }
 
     # ------------------------------------------------------------------------ 4. scores under every version
@@ -1076,7 +1119,7 @@ def main(argv=None) -> dict:
     for r in loaded:
         sc = sidecars[r.trajectory_id]
         if r.trajectory_id in rejected:
-            logged["unrepairable"] += 1  # its logged verdict rests on evidence the digest does not bind
+            logged["unrepairable"] += 1  # its logged verdict rests on evidence the digests do not bind
             continue
         spec = g1.entries[r.task_id][ANY_WORLD]
         classes = [logged_suite_class(sc, c.name) for c in iter_checks(spec)]

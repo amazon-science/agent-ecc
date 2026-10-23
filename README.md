@@ -146,8 +146,9 @@ lives in the example, not in the package), builds the execution records, every p
 evaluation manifests by re-parsing stored logs (nothing is executed; a check that needs an execution nobody recorded is
 undeterminable), turns the trainer's logged seals into seal decisions linked to records and scores, joins the
 learner's own per-record log, and reproduces the first version's result from the records as written. A sidecar
-whose outcome digest is missing or does not match its trajectory and patch is unrepairable and its evidence is never
-read (`--no-outcome-digest` for runs that recorded none):
+whose outcome digest is missing or does not match its trajectory and patch, or whose evidence binding (the trainer's
+digest of the whole sidecar) is missing or no longer matches, is unrepairable and its evidence is never read, whatever
+the seal later did with it (`--no-outcome-digest` and `--no-evidence-binding` for runs that recorded none):
 
 ```bash
 python examples/posthoc/run.py --run RUN_DIR --out OUT [--executions LATER_REEXECUTIONS_DIR]

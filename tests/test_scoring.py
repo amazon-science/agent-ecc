@@ -332,6 +332,28 @@ def test_prior_scores_must_belong_to_the_record(env):
         scorer.score([ScoreInput(rec_b, (score_a,))], version("g", c1))
 
 
+def test_a_prior_score_of_another_record_is_refused_on_every_path(env):
+    """The check does not depend on how the record would be decided: not for a task the version does not govern (whose
+    recorded verdict is taken from the prior score), not for an unknown world, a torn observation or a family no
+    adapter serves."""
+    store, adapter, _, scorer = env
+    c1 = check("t", "plain", "ab", store)
+    rec_a, score_a = graded(store, adapter, c1, "ab", trajectory="a")
+    rec_b, _ = graded(store, adapter, c1, "ab", trajectory="b")
+    governed = version("g", c1)
+    ungoverned = GraderVersion(name="o", entries={"other-task": c1})
+    per_world = GraderVersion(name="pw", entries={"t": {"w1": c1}})
+    torn = adapter.record(store, task="t", trajectory="torn", answer="ab", runs=rec_b.runs, observed=("w0", "w1"))
+    alien = rec_b.__class__(family="unknown", task_id="t", trajectory_id="x")
+    for record, grader in ((rec_b, governed), (rec_b, ungoverned), (rec_b, per_world), (torn, governed),
+                           (alien, governed)):
+        with pytest.raises(ValueError, match="another execution"):
+            scorer.score([ScoreInput(record, (score_a,))], grader)
+    # and a score of its own record is still accepted on those paths
+    out = scorer.score([ScoreInput(rec_a, (score_a,))], ungoverned)[0]
+    assert out.action == "ungoverned" and out.score.based_on == score_a.score_id
+
+
 def test_grade_recorded_short_circuits_and_reports_missing_runs(env):
     store, adapter, _, _ = env
     base, hard = check("t", "plain", "ab", store), check("t", "rev", "ba", store)
